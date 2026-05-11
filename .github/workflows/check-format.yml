@@ -2,7 +2,7 @@ name: Checkpatch
 
 on:
   push:
-  - paths
+  - push
   - pull_request
 
 jobs:
