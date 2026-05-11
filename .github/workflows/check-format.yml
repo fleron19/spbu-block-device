@@ -1,0 +1,47 @@
+name: Checkpatch
+
+on:
+  push:
+  - paths
+  - pull_request
+
+jobs:
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y perl curl
+
+      - name: Download checkpatch.pl
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl -o ./checkpatch.pl
+          chmod +x ./checkpatch.pl
+
+      - name: Run checkpatch on src
+        run: |
+          set -o pipefail
+          files=$(find src -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' -o -name '*.cpp' -o -name '*.hpp' \))
+          if [ -z "$files" ]; then
+            echo "No source files found under src."
+            exit 0
+          fi
+          echo "$files" | xargs -r ./checkpatch.pl --strict --no-tree 2>&1 | tee checkpatch.out || true
+          if grep -Eq "ERROR:|FIXME:|unable to parse" checkpatch.out; then
+            echo "::error file=checkpatch.out::checkpatch found errors"
+            exit 1
+          fi
+          WARN_COUNT=$(grep -c "^WARNING:" checkpatch.out || true)
+          if [ "$WARN_COUNT" -gt 50 ]; then
+            echo "::warning::Too many checkpatch warnings: $WARN_COUNT"
+          fi
+
+      - name: Upload checkpatch report
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpatch-report
+          path: checkpatch.out
