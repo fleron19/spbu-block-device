@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
+#include <linux/blkdev.h>
 #include <linux/bio.h>
 #include <linux/vmalloc.h>
 #include <linux/blk-mq.h>
@@ -13,8 +14,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/blk_types.h>
-#include <linux/blkdev.h>
-#include <linux/hdreg.h>
+#include <linux/string.h>
 
 #define SECTOR_SHIFT 9
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
@@ -42,7 +42,6 @@ static int ramblock_transfer(struct request *req)
 	sector_t sector = blk_rq_pos(req);
 	unsigned long offset_bytes;
 	unsigned int len;
-	int ret = 0;
 
 	if (rq_data_dir(req) != READ && rq_data_dir(req) != WRITE)
 		return BLK_STS_IOERR;
@@ -76,10 +75,10 @@ static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
 				      const struct blk_mq_queue_data *bd)
 {
 	struct request *req = bd->rq;
-	blk_status_t ret;
+	blk_status_t st;
 
-	ret = ramblock_transfer(req);
-	__blk_mq_end_request(req, ret ? BLK_STS_IOERR : BLK_STS_OK);
+	st = ramblock_transfer(req);
+	__blk_mq_end_request(req, st);
 	return BLK_STS_OK;
 }
 
@@ -127,6 +126,7 @@ static int __init ramblock_init(void)
 		pr_err("%s: blk_mq_init_queue failed: %d\n", RAMBLOCK_NAME, ret);
 		goto err_free_tag_set;
 	}
+
 	blk_queue_logical_block_size(queue, SECTOR_SIZE);
 
 	gd = alloc_disk(RAMBLOCK_MINORS);
