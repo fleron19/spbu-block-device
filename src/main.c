@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ramblock - simple RAM block device
- * For Linux 6.18.13 
+ * ramblock - simple RAM block device for Linux 6.18.13
  */
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
-#include <linux/blkdev.h>
 #include <linux/bio.h>
 #include <linux/vmalloc.h>
 #include <linux/blk-mq.h>
@@ -15,6 +13,8 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/blk_types.h>
+#include <linux/blkdev.h>
+#include <linux/hdreg.h>
 
 #define SECTOR_SHIFT 9
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
@@ -22,39 +22,45 @@
 #define RAMBLOCK_SECTORS (RAMBLOCK_SIZE_BYTES / SECTOR_SIZE)
 #define RAMBLOCK_NAME "ramblock"
 #define RAMBLOCK_MINORS 16
+#define QUEUE_DEPTH 128
 
 static int major_num;
 static sector_t capacity;
 static u8 *data;
 static struct gendisk *gd;
+static struct blk_mq_tag_set tag_set;
 static struct request_queue *queue;
 
 static const struct block_device_operations ramblock_fops = {
 	.owner = THIS_MODULE,
 };
 
-static void ramblock_make_request(struct request_queue *q, struct bio *bio)
+static int ramblock_transfer(struct request *req)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
-	sector_t sector = bio->bi_iter.bi_sector;
-	unsigned int len;
+	sector_t sector = blk_rq_pos(req);
 	unsigned long offset_bytes;
+	unsigned int len;
+	int ret = 0;
 
-	bio_for_each_segment_all(bv, bio, iter) {
+	if (rq_data_dir(req) != READ && rq_data_dir(req) != WRITE)
+		return BLK_STS_IOERR;
+
+	rq_for_each_segment(bv, req, iter) {
 		void *kaddr;
+
 		len = bv.bv_len;
 		offset_bytes = (sector << SECTOR_SHIFT);
 
 		if (offset_bytes + bv.bv_offset + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
 			pr_err("%s: I/O out of bounds (sector %llu len %u off %u)\n",
 			       RAMBLOCK_NAME, (unsigned long long)sector, len, bv.bv_offset);
-			bio_endio(bio);
-			return;
+			return BLK_STS_IOERR;
 		}
 
 		kaddr = kmap_local_page(bv.bv_page);
-		if (bio_op(bio) == REQ_OP_READ)
+		if (rq_data_dir(req) == READ)
 			memcpy(kaddr + bv.bv_offset, data + offset_bytes, len);
 		else
 			memcpy(data + offset_bytes, kaddr + bv.bv_offset, len);
@@ -63,12 +69,27 @@ static void ramblock_make_request(struct request_queue *q, struct bio *bio)
 		sector += len >> SECTOR_SHIFT;
 	}
 
-	bio_endio(bio);
+	return BLK_STS_OK;
 }
+
+static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
+				      const struct blk_mq_queue_data *bd)
+{
+	struct request *req = bd->rq;
+	blk_status_t ret;
+
+	ret = ramblock_transfer(req);
+	__blk_mq_end_request(req, ret ? BLK_STS_IOERR : BLK_STS_OK);
+	return BLK_STS_OK;
+}
+
+static struct blk_mq_ops ramblock_mq_ops = {
+	.queue_rq = ramblock_queue_rq,
+};
 
 static int __init ramblock_init(void)
 {
-	int ret = 0;
+	int ret;
 
 	data = vzalloc(RAMBLOCK_SIZE_BYTES);
 	if (!data) {
@@ -85,21 +106,34 @@ static int __init ramblock_init(void)
 		goto err_vfree;
 	}
 
-	queue = blk_alloc_queue(GFP_KERNEL);
-	if (!queue) {
-		pr_err("%s: failed to allocate request queue\n", RAMBLOCK_NAME);
-		ret = -ENOMEM;
+	memset(&tag_set, 0, sizeof(tag_set));
+	tag_set.ops = &ramblock_mq_ops;
+	tag_set.nr_hw_queues = 1;
+	tag_set.queue_depth = QUEUE_DEPTH;
+	tag_set.numa_node = NUMA_NO_NODE;
+	tag_set.cmd_size = 0;
+	tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+	tag_set.driver_data = NULL;
+
+	ret = blk_mq_alloc_tag_set(&tag_set);
+	if (ret) {
+		pr_err("%s: blk_mq_alloc_tag_set failed: %d\n", RAMBLOCK_NAME, ret);
 		goto err_unregister_blkdev;
 	}
 
-	blk_queue_make_request(queue, ramblock_make_request);
+	queue = blk_mq_init_queue(&tag_set);
+	if (IS_ERR(queue)) {
+		ret = PTR_ERR(queue);
+		pr_err("%s: blk_mq_init_queue failed: %d\n", RAMBLOCK_NAME, ret);
+		goto err_free_tag_set;
+	}
 	blk_queue_logical_block_size(queue, SECTOR_SIZE);
 
 	gd = alloc_disk(RAMBLOCK_MINORS);
 	if (!gd) {
-		pr_err("%s: failed to allocate gendisk\n", RAMBLOCK_NAME);
+		pr_err("%s: alloc_disk failed\n", RAMBLOCK_NAME);
 		ret = -ENOMEM;
-		goto err_blk_cleanup_queue;
+		goto err_cleanup_queue;
 	}
 
 	gd->major = major_num;
@@ -114,10 +148,10 @@ static int __init ramblock_init(void)
 	pr_info("%s: registered with major %d\n", RAMBLOCK_NAME, major_num);
 	return 0;
 
-err_put_disk:
-	put_disk(gd);
-err_blk_cleanup_queue:
+err_cleanup_queue:
 	blk_cleanup_queue(queue);
+err_free_tag_set:
+	blk_mq_free_tag_set(&tag_set);
 err_unregister_blkdev:
 	unregister_blkdev(major_num, RAMBLOCK_NAME);
 err_vfree:
@@ -133,6 +167,7 @@ static void __exit ramblock_exit(void)
 	}
 	if (queue)
 		blk_cleanup_queue(queue);
+	blk_mq_free_tag_set(&tag_set);
 	unregister_blkdev(major_num, RAMBLOCK_NAME);
 	vfree(data);
 
