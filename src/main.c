@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * ramblock - simple RAM block device
- * Adapted for Linux 6.18.13
+ * For Linux 6.18.13 
  */
 
 #include <linux/module.h>
@@ -9,11 +9,12 @@
 #include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
-#include <linux/genhd.h>
 #include <linux/vmalloc.h>
 #include <linux/blk-mq.h>
 #include <linux/errno.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
+#include <linux/blk_types.h>
 
 #define SECTOR_SHIFT 9
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
@@ -39,29 +40,25 @@ static void ramblock_make_request(struct request_queue *q, struct bio *bio)
 	sector_t sector = bio->bi_iter.bi_sector;
 	unsigned int len;
 	unsigned long offset_bytes;
-	u8 *dev_addr;
 
-	/* iterate all segments */
 	bio_for_each_segment_all(bv, bio, iter) {
 		void *kaddr;
 		len = bv.bv_len;
 		offset_bytes = (sector << SECTOR_SHIFT);
 
-		/* bounds check */
-		if (offset_bytes + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
-			pr_err("%s: I/O out of bounds (sector %llu len %u)\n",
-			       RAMBLOCK_NAME, (unsigned long long)sector, len);
+		if (offset_bytes + bv.bv_offset + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
+			pr_err("%s: I/O out of bounds (sector %llu len %u off %u)\n",
+			       RAMBLOCK_NAME, (unsigned long long)sector, len, bv.bv_offset);
 			bio_endio(bio);
 			return;
 		}
 
-		/* map page */
-		kaddr = kmap_atomic(bv.bv_page);
-		if (bio_data_dir(bio) == READ)
+		kaddr = kmap_local_page(bv.bv_page);
+		if (bio_op(bio) == REQ_OP_READ)
 			memcpy(kaddr + bv.bv_offset, data + offset_bytes, len);
 		else
 			memcpy(data + offset_bytes, kaddr + bv.bv_offset, len);
-		kunmap_atomic(kaddr);
+		kunmap_local(kaddr);
 
 		sector += len >> SECTOR_SHIFT;
 	}
@@ -110,7 +107,7 @@ static int __init ramblock_init(void)
 	gd->fops = &ramblock_fops;
 	gd->queue = queue;
 	set_capacity(gd, capacity);
-	snprintf(gd->disk_name, DISK_NAME_LEN, RAMBLOCK_NAME);
+	strlcpy(gd->disk_name, RAMBLOCK_NAME, DISK_NAME_LEN);
 
 	add_disk(gd);
 
