@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ramblock - simple RAM block device for Linux 6.18.13
+ * ramblock - simple RAM block device for Linux 6.18
+ *
+ * Tested with Linux 6.18.x headers
  */
 
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/init.h>
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
 #include <linux/bio.h>
 #include <linux/vmalloc.h>
-#include <linux/blk-mq.h>
-#include <linux/errno.h>
 #include <linux/slab.h>
-#include <linux/mm.h>
-#include <linux/blk_types.h>
+#include <linux/highmem.h>
+#include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/ktime.h>
 
 #define SECTOR_SHIFT 9
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
@@ -31,6 +32,7 @@ static struct gendisk *gd;
 static struct blk_mq_tag_set tag_set;
 static struct request_queue *queue;
 
+/* block device operations */
 static const struct block_device_operations ramblock_fops = {
 	.owner = THIS_MODULE,
 };
@@ -43,7 +45,7 @@ static int ramblock_transfer(struct request *req)
 	unsigned long offset_bytes;
 	unsigned int len;
 
-	if (rq_data_dir(req) != READ && rq_data_dir(req) != WRITE)
+	if (blk_rq_is_passthrough(req))
 		return BLK_STS_IOERR;
 
 	rq_for_each_segment(bv, req, iter) {
@@ -78,12 +80,14 @@ static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
 	blk_status_t st;
 
 	st = ramblock_transfer(req);
+	blk_mq_start_request(req); /* mark request started (optional) */
 	__blk_mq_end_request(req, st);
 	return BLK_STS_OK;
 }
 
 static struct blk_mq_ops ramblock_mq_ops = {
 	.queue_rq = ramblock_queue_rq,
+	.complete = NULL,
 };
 
 static int __init ramblock_init(void)
@@ -110,9 +114,9 @@ static int __init ramblock_init(void)
 	tag_set.nr_hw_queues = 1;
 	tag_set.queue_depth = QUEUE_DEPTH;
 	tag_set.numa_node = NUMA_NO_NODE;
-	tag_set.cmd_size = 0;
 	tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
 	tag_set.driver_data = NULL;
+	tag_set.cmd_size = 0;
 
 	ret = blk_mq_alloc_tag_set(&tag_set);
 	if (ret) {
@@ -127,11 +131,13 @@ static int __init ramblock_init(void)
 		goto err_free_tag_set;
 	}
 
+	/* logical block size */
 	blk_queue_logical_block_size(queue, SECTOR_SIZE);
 
-	gd = alloc_disk(RAMBLOCK_MINORS);
+	/* allocate gendisk associated with tag_set / queue */
+	gd = blk_mq_alloc_disk(&tag_set, RAMBLOCK_MINORS);
 	if (!gd) {
-		pr_err("%s: alloc_disk failed\n", RAMBLOCK_NAME);
+		pr_err("%s: blk_mq_alloc_disk failed\n", RAMBLOCK_NAME);
 		ret = -ENOMEM;
 		goto err_cleanup_queue;
 	}
@@ -141,7 +147,8 @@ static int __init ramblock_init(void)
 	gd->fops = &ramblock_fops;
 	gd->queue = queue;
 	set_capacity(gd, capacity);
-	strlcpy(gd->disk_name, RAMBLOCK_NAME, DISK_NAME_LEN);
+	/* copy device name */
+	strscpy(gd->disk_name, RAMBLOCK_NAME, sizeof(gd->disk_name));
 
 	add_disk(gd);
 
