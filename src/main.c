@@ -2,7 +2,6 @@
 /*
  * ramblock - simple RAM block device for Linux 6.18
  *
- * Tested with Linux 6.18.x headers
  */
 
 #include <linux/module.h>
@@ -25,49 +24,47 @@
 #define RAMBLOCK_MINORS 16
 #define QUEUE_DEPTH 128
 
-static int major_num;
 static sector_t capacity;
 static u8 *data;
 static struct gendisk *gd;
 static struct blk_mq_tag_set tag_set;
-static struct request_queue *queue;
 
-/* block device operations */
 static const struct block_device_operations ramblock_fops = {
-	.owner = THIS_MODULE,
 };
 
 static int ramblock_transfer(struct request *req)
 {
+	struct bio *bio;
 	struct bio_vec bv;
 	struct bvec_iter iter;
-	sector_t sector = blk_rq_pos(req);
-	unsigned long offset_bytes;
-	unsigned int len;
 
 	if (blk_rq_is_passthrough(req))
 		return BLK_STS_IOERR;
 
-	rq_for_each_segment(bv, req, iter) {
-		void *kaddr;
+	__rq_for_each_bio(bio, req) {
+		sector_t sector = bio->bi_iter.bi_sector;
 
-		len = bv.bv_len;
-		offset_bytes = (sector << SECTOR_SHIFT);
+		bio_for_each_segment(bv, bio, iter) {
+			void *kaddr;
+			unsigned long offset_bytes;
+			unsigned int len = bv.bv_len;
 
-		if (offset_bytes + bv.bv_offset + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
-			pr_err("%s: I/O out of bounds (sector %llu len %u off %u)\n",
-			       RAMBLOCK_NAME, (unsigned long long)sector, len, bv.bv_offset);
-			return BLK_STS_IOERR;
+			offset_bytes = (sector << SECTOR_SHIFT);
+
+			if (offset_bytes + bv.bv_offset + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
+				pr_err("%s: I/O out of bounds\n", RAMBLOCK_NAME);
+				return BLK_STS_IOERR;
+			}
+
+			kaddr = kmap_local_page(bv.bv_page);
+			if (bio_data_dir(bio) == READ)
+				memcpy(kaddr + bv.bv_offset, data + offset_bytes, len);
+			else
+				memcpy(data + offset_bytes, kaddr + bv.bv_offset, len);
+			kunmap_local(kaddr);
+
+			sector += len >> SECTOR_SHIFT;
 		}
-
-		kaddr = kmap_local_page(bv.bv_page);
-		if (rq_data_dir(req) == READ)
-			memcpy(kaddr + bv.bv_offset, data + offset_bytes, len);
-		else
-			memcpy(data + offset_bytes, kaddr + bv.bv_offset, len);
-		kunmap_local(kaddr);
-
-		sector += len >> SECTOR_SHIFT;
 	}
 
 	return BLK_STS_OK;
@@ -79,8 +76,8 @@ static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct request *req = bd->rq;
 	blk_status_t st;
 
+	blk_mq_start_request(req);
 	st = ramblock_transfer(req);
-	blk_mq_start_request(req); /* mark request started (optional) */
 	__blk_mq_end_request(req, st);
 	return BLK_STS_OK;
 }
@@ -93,6 +90,10 @@ static struct blk_mq_ops ramblock_mq_ops = {
 static int __init ramblock_init(void)
 {
 	int ret;
+	struct queue_limits lim = {
+		.logical_block_size = SECTOR_SIZE,
+		.physical_block_size = SECTOR_SIZE,
+	};
 
 	data = vzalloc(RAMBLOCK_SIZE_BYTES);
 	if (!data) {
@@ -102,65 +103,43 @@ static int __init ramblock_init(void)
 
 	capacity = RAMBLOCK_SECTORS;
 
-	major_num = register_blkdev(0, RAMBLOCK_NAME);
-	if (major_num < 0) {
-		pr_err("%s: failed to register block device\n", RAMBLOCK_NAME);
-		ret = major_num;
-		goto err_vfree;
-	}
-
 	memset(&tag_set, 0, sizeof(tag_set));
 	tag_set.ops = &ramblock_mq_ops;
 	tag_set.nr_hw_queues = 1;
 	tag_set.queue_depth = QUEUE_DEPTH;
 	tag_set.numa_node = NUMA_NO_NODE;
-	tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
-	tag_set.driver_data = NULL;
-	tag_set.cmd_size = 0;
 
 	ret = blk_mq_alloc_tag_set(&tag_set);
 	if (ret) {
 		pr_err("%s: blk_mq_alloc_tag_set failed: %d\n", RAMBLOCK_NAME, ret);
-		goto err_unregister_blkdev;
+		goto err_vfree;
 	}
 
-	queue = blk_mq_init_queue(&tag_set);
-	if (IS_ERR(queue)) {
-		ret = PTR_ERR(queue);
-		pr_err("%s: blk_mq_init_queue failed: %d\n", RAMBLOCK_NAME, ret);
+	gd = blk_mq_alloc_disk(&tag_set, &lim, NULL);
+	if (IS_ERR(gd)) {
+		ret = PTR_ERR(gd);
+		pr_err("%s: blk_mq_alloc_disk failed: %d\n", RAMBLOCK_NAME, ret);
 		goto err_free_tag_set;
 	}
 
-	/* logical block size */
-	blk_queue_logical_block_size(queue, SECTOR_SIZE);
-
-	/* allocate gendisk associated with tag_set / queue */
-	gd = blk_mq_alloc_disk(&tag_set, RAMBLOCK_MINORS);
-	if (!gd) {
-		pr_err("%s: blk_mq_alloc_disk failed\n", RAMBLOCK_NAME);
-		ret = -ENOMEM;
-		goto err_cleanup_queue;
-	}
-
-	gd->major = major_num;
-	gd->first_minor = 0;
+	gd->minors = RAMBLOCK_MINORS;
 	gd->fops = &ramblock_fops;
-	gd->queue = queue;
 	set_capacity(gd, capacity);
-	/* copy device name */
 	strscpy(gd->disk_name, RAMBLOCK_NAME, sizeof(gd->disk_name));
 
-	add_disk(gd);
+	ret = add_disk(gd);
+	if (ret) {
+		pr_err("%s: add_disk failed: %d\n", RAMBLOCK_NAME, ret);
+		goto err_put_disk;
+	}
 
-	pr_info("%s: registered with major %d\n", RAMBLOCK_NAME, major_num);
+	pr_info("%s: registered\n", RAMBLOCK_NAME);
 	return 0;
 
-err_cleanup_queue:
-	blk_cleanup_queue(queue);
+err_put_disk:
+	put_disk(gd);
 err_free_tag_set:
 	blk_mq_free_tag_set(&tag_set);
-err_unregister_blkdev:
-	unregister_blkdev(major_num, RAMBLOCK_NAME);
 err_vfree:
 	vfree(data);
 	return ret;
@@ -172,10 +151,7 @@ static void __exit ramblock_exit(void)
 		del_gendisk(gd);
 		put_disk(gd);
 	}
-	if (queue)
-		blk_cleanup_queue(queue);
 	blk_mq_free_tag_set(&tag_set);
-	unregister_blkdev(major_num, RAMBLOCK_NAME);
 	vfree(data);
 
 	pr_info("%s: unregistered\n", RAMBLOCK_NAME);
