@@ -21,7 +21,6 @@
 #define RAMBLOCK_SIZE_BYTES (4 * 1024 * 1024) /* 4 MiB */
 #define RAMBLOCK_SECTORS (RAMBLOCK_SIZE_BYTES / SECTOR_SIZE)
 #define RAMBLOCK_NAME "ramblock"
-#define RAMBLOCK_MINORS 16
 #define QUEUE_DEPTH 128
 
 static sector_t capacity;
@@ -78,7 +77,7 @@ static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	blk_mq_start_request(req);
 	st = ramblock_transfer(req);
-	__blk_mq_end_request(req, st);
+	blk_mq_end_request(req, st);
 	return BLK_STS_OK;
 }
 
@@ -122,11 +121,9 @@ static int __init ramblock_init(void)
 		goto err_free_tag_set;
 	}
 
-	gd->minors = RAMBLOCK_MINORS;
 	gd->fops = &ramblock_fops;
 	set_capacity(gd, capacity);
 	strscpy(gd->disk_name, RAMBLOCK_NAME, sizeof(gd->disk_name));
-
 	ret = add_disk(gd);
 	if (ret) {
 		pr_err("%s: add_disk failed: %d\n", RAMBLOCK_NAME, ret);
