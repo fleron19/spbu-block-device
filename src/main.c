@@ -20,7 +20,7 @@
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
 #define RAMBLOCK_SIZE_BYTES (4 * 1024 * 1024) /* 4 MiB */
 #define RAMBLOCK_SECTORS (RAMBLOCK_SIZE_BYTES / SECTOR_SIZE)
-#define RAMBLOCK_NAME "ramblock"
+#define RAMBLOCK_NAME "block-device"
 #define QUEUE_DEPTH 128
 
 static sector_t capacity;
