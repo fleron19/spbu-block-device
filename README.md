@@ -29,6 +29,8 @@ sudo umount /mnt/block-device
 sudo rmmod block-device
 ```
 ## Testing
-TODO
-
-
+To test block-device, run in root:
+```bash
+sudo ./test.sh
+````
+This script will build, mount test and unmount device

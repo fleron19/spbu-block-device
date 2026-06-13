@@ -7,7 +7,6 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/blkdev.h>
-#include <linux/blk-mq.h>
 #include <linux/bio.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
@@ -16,75 +15,65 @@
 #include <linux/string.h>
 #include <linux/ktime.h>
 
-#define SECTOR_SHIFT 9
-#define SECTOR_SIZE (1 << SECTOR_SHIFT)
 #define RAMBLOCK_SIZE_BYTES (4 * 1024 * 1024) /* 4 MiB */
 #define RAMBLOCK_SECTORS (RAMBLOCK_SIZE_BYTES / SECTOR_SIZE)
 #define RAMBLOCK_NAME "block-device"
-#define QUEUE_DEPTH 128
+sector_t capacity;
+u8 *data;
+struct gendisk *gd;
 
-static sector_t capacity;
-static u8 *data;
-static struct gendisk *gd;
-static struct blk_mq_tag_set tag_set;
+static void ramblock_submit_bio(struct bio *bio);
 
 static const struct block_device_operations ramblock_fops = {
+	.submit_bio = ramblock_submit_bio,
 };
 
-static int ramblock_transfer(struct request *req)
+static inline sector_t bytes_to_sectors(loff_t bytes)
 {
-	struct bio *bio;
+	return bytes >> SECTOR_SHIFT;
+}
+
+static inline loff_t sector_to_bytes(sector_t sector)
+{
+	return sector << SECTOR_SHIFT;
+}
+
+static blk_status_t ramblock_transfer(struct bio *bio)
+{
 	struct bio_vec bv;
 	struct bvec_iter iter;
+	sector_t sector = bio->bi_iter.bi_sector;
 
-	if (blk_rq_is_passthrough(req))
-		return BLK_STS_IOERR;
+	for_each_bvec(bv, bio->bi_io_vec, iter, bio->bi_iter) {
+		void *kaddr;
+		loff_t pos = sector_to_bytes(sector);
+		unsigned int len = bv.bv_len;
 
-	__rq_for_each_bio(bio, req) {
-		sector_t sector = bio->bi_iter.bi_sector;
-
-		bio_for_each_segment(bv, bio, iter) {
-			void *kaddr;
-			unsigned long offset_bytes;
-			unsigned int len = bv.bv_len;
-
-			offset_bytes = (sector << SECTOR_SHIFT);
-
-			if (offset_bytes + bv.bv_offset + len > (unsigned long)RAMBLOCK_SIZE_BYTES) {
-				pr_err("%s: I/O out of bounds\n", RAMBLOCK_NAME);
-				return BLK_STS_IOERR;
-			}
-
-			kaddr = kmap_local_page(bv.bv_page);
-			if (bio_data_dir(bio) == READ)
-				memcpy(kaddr + bv.bv_offset, data + offset_bytes, len);
-			else
-				memcpy(data + offset_bytes, kaddr + bv.bv_offset, len);
-			kunmap_local(kaddr);
-
-			sector += len >> SECTOR_SHIFT;
+		if (pos + bv.bv_offset + len > RAMBLOCK_SIZE_BYTES) {
+			pr_err("%s: I/O out of bounds\n", RAMBLOCK_NAME);
+			return BLK_STS_IOERR;
 		}
+
+		kaddr = kmap_local_page(bv.bv_page);
+		if (bio_data_dir(bio) == READ)
+			memcpy(kaddr + bv.bv_offset, data + pos, len);
+		else
+			memcpy(data + pos, kaddr + bv.bv_offset, len);
+		kunmap_local(kaddr);
+
+		sector += bytes_to_sectors(len);
 	}
 
 	return BLK_STS_OK;
 }
 
-static blk_status_t ramblock_queue_rq(struct blk_mq_hw_ctx *hctx,
-				      const struct blk_mq_queue_data *bd)
+static void ramblock_submit_bio(struct bio *bio)
 {
-	struct request *req = bd->rq;
-	blk_status_t st;
+	blk_status_t err = ramblock_transfer(bio);
 
-	blk_mq_start_request(req);
-	st = ramblock_transfer(req);
-	blk_mq_end_request(req, st);
-	return BLK_STS_OK;
+	bio->bi_status = err;
+	bio_endio(bio);
 }
-
-static struct blk_mq_ops ramblock_mq_ops = {
-	.queue_rq = ramblock_queue_rq,
-	.complete = NULL,
-};
 
 static int __init ramblock_init(void)
 {
@@ -102,23 +91,11 @@ static int __init ramblock_init(void)
 
 	capacity = RAMBLOCK_SECTORS;
 
-	memset(&tag_set, 0, sizeof(tag_set));
-	tag_set.ops = &ramblock_mq_ops;
-	tag_set.nr_hw_queues = 1;
-	tag_set.queue_depth = QUEUE_DEPTH;
-	tag_set.numa_node = NUMA_NO_NODE;
-
-	ret = blk_mq_alloc_tag_set(&tag_set);
-	if (ret) {
-		pr_err("%s: blk_mq_alloc_tag_set failed: %d\n", RAMBLOCK_NAME, ret);
-		goto err_vfree;
-	}
-
-	gd = blk_mq_alloc_disk(&tag_set, &lim, NULL);
+	gd = blk_alloc_disk(&lim, NUMA_NO_NODE);
 	if (IS_ERR(gd)) {
 		ret = PTR_ERR(gd);
-		pr_err("%s: blk_mq_alloc_disk failed: %d\n", RAMBLOCK_NAME, ret);
-		goto err_free_tag_set;
+		pr_err("%s: blk_alloc_disk failed: %d\n", RAMBLOCK_NAME, ret);
+		goto err_vfree;
 	}
 
 	gd->fops = &ramblock_fops;
@@ -135,8 +112,6 @@ static int __init ramblock_init(void)
 
 err_put_disk:
 	put_disk(gd);
-err_free_tag_set:
-	blk_mq_free_tag_set(&tag_set);
 err_vfree:
 	vfree(data);
 	return ret;
@@ -148,7 +123,6 @@ static void __exit ramblock_exit(void)
 		del_gendisk(gd);
 		put_disk(gd);
 	}
-	blk_mq_free_tag_set(&tag_set);
 	vfree(data);
 
 	pr_info("%s: unregistered\n", RAMBLOCK_NAME);
