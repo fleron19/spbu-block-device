@@ -1,93 +1,136 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * A hello world kernel example: Anna Vasenina <almazisdev@gmail.com>
+ * ramblock - simple RAM block device for Linux 6.18
+ *
  */
 
 #include <linux/module.h>
-#include <linux/moduleparam.h>
+#include <linux/init.h>
+#include <linux/blkdev.h>
+#include <linux/bio.h>
+#include <linux/vmalloc.h>
+#include <linux/slab.h>
+#include <linux/highmem.h>
+#include <linux/errno.h>
+#include <linux/string.h>
+#include <linux/ktime.h>
 
-static char *hwm_name; 
-static int hwm_hello_times = 1;
+#define RAMBLOCK_SIZE_BYTES (4 * 1024 * 1024) /* 4 MiB */
+#define RAMBLOCK_SECTORS (RAMBLOCK_SIZE_BYTES / SECTOR_SIZE)
+#define RAMBLOCK_NAME "block-device"
+sector_t capacity;
+u8 *data;
+struct gendisk *gd;
 
-static int __init hwm_init(void)
+static void ramblock_submit_bio(struct bio *bio);
+
+static const struct block_device_operations ramblock_fops = {
+	.submit_bio = ramblock_submit_bio,
+};
+
+static inline sector_t bytes_to_sectors(loff_t bytes)
 {
-	pr_info("hwm init\n");
-
-	return 0;
+	return bytes >> SECTOR_SHIFT;
 }
 
-static void __exit hwm_exit(void)
+static inline loff_t sector_to_bytes(sector_t sector)
 {
-	kfree(hwm_name);
-
-	pr_info("hwm exit\n");
+	return sector << SECTOR_SHIFT;
 }
 
-static int hwm_user_name_set(const char *arg, const struct kernel_param *kp)
+static blk_status_t ramblock_transfer(struct bio *bio)
 {
-	ssize_t len = strlen(arg) + 1;
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	sector_t sector = bio->bi_iter.bi_sector;
 
-	if (hwm_name) {
-		kfree(hwm_name);
-		hwm_name = NULL;
+	for_each_bvec(bv, bio->bi_io_vec, iter, bio->bi_iter) {
+		void *kaddr;
+		loff_t pos = sector_to_bytes(sector);
+		unsigned int len = bv.bv_len;
+
+		if (pos + bv.bv_offset + len > RAMBLOCK_SIZE_BYTES) {
+			pr_err("%s: I/O out of bounds\n", RAMBLOCK_NAME);
+			return BLK_STS_IOERR;
+		}
+
+		kaddr = kmap_local_page(bv.bv_page);
+		if (bio_data_dir(bio) == READ)
+			memcpy(kaddr + bv.bv_offset, data + pos, len);
+		else
+			memcpy(data + pos, kaddr + bv.bv_offset, len);
+		kunmap_local(kaddr);
+
+		sector += bytes_to_sectors(len);
 	}
-	
-	hwm_name = kzalloc(sizeof(char) * len, GFP_KERNEL);
-	if (!hwm_name)
+
+	return BLK_STS_OK;
+}
+
+static void ramblock_submit_bio(struct bio *bio)
+{
+	blk_status_t err = ramblock_transfer(bio);
+
+	bio->bi_status = err;
+	bio_endio(bio);
+}
+
+static int __init ramblock_init(void)
+{
+	int ret;
+	struct queue_limits lim = {
+		.logical_block_size = SECTOR_SIZE,
+		.physical_block_size = SECTOR_SIZE,
+	};
+
+	data = vzalloc(RAMBLOCK_SIZE_BYTES);
+	if (!data) {
+		pr_err("%s: failed to allocate memory\n", RAMBLOCK_NAME);
 		return -ENOMEM;
-	strcpy(hwm_name, arg);
-	
+	}
+
+	capacity = RAMBLOCK_SECTORS;
+
+	gd = blk_alloc_disk(&lim, NUMA_NO_NODE);
+	if (IS_ERR(gd)) {
+		ret = PTR_ERR(gd);
+		pr_err("%s: blk_alloc_disk failed: %d\n", RAMBLOCK_NAME, ret);
+		goto err_vfree;
+	}
+
+	gd->fops = &ramblock_fops;
+	set_capacity(gd, capacity);
+	strscpy(gd->disk_name, RAMBLOCK_NAME, sizeof(gd->disk_name));
+	ret = add_disk(gd);
+	if (ret) {
+		pr_err("%s: add_disk failed: %d\n", RAMBLOCK_NAME, ret);
+		goto err_put_disk;
+	}
+
+	pr_info("%s: registered\n", RAMBLOCK_NAME);
 	return 0;
+
+err_put_disk:
+	put_disk(gd);
+err_vfree:
+	vfree(data);
+	return ret;
 }
 
-static int hwm_user_name_get(char *buf, const struct kernel_param *kp)
+static void __exit ramblock_exit(void)
 {
-	ssize_t len;
+	if (gd) {
+		del_gendisk(gd);
+		put_disk(gd);
+	}
+	vfree(data);
 
-	if (!hwm_name)
-		return -EINVAL;
-	len = strlen(hwm_name);
-
-	strcpy(buf, hwm_name);
-
-	return len;
+	pr_info("%s: unregistered\n", RAMBLOCK_NAME);
 }
 
-static const struct kernel_param_ops hwm_user_name_ops = {
-	.set = hwm_user_name_set,
-	.get = hwm_user_name_get,
-};
+module_init(ramblock_init);
+module_exit(ramblock_exit);
 
-static int hwm_say_hello(const char *arg, const struct kernel_param *kp)
-{
-	int i;
-
-	if (!hwm_name)
-		return -EINVAL;
-
-	for (i = 0; i < hwm_hello_times; i++)
-		pr_warn("%d hello %s", i, hwm_name);
-
-	return 0;
-}
-
-static const struct kernel_param_ops hwm_say_hello_ops = {
-	.set = hwm_say_hello,
-	.get = NULL,
-};
-
-MODULE_PARM_DESC(user_name, "User name");
-module_param_cb(user_name, &hwm_user_name_ops, NULL, S_IRUGO | S_IWUSR);
-
-MODULE_PARM_DESC(say_hello, "Say hello");
-module_param_cb(say_hello, &hwm_say_hello_ops, NULL, S_IWUSR);
-
-MODULE_PARM_DESC(hello_times, "How many times to say hello");
-module_param_named(hello_times, hwm_hello_times, int, S_IRUGO | S_IWUSR);
-
-module_init(hwm_init);
-module_exit(hwm_exit);
-
-MODULE_AUTHOR("Anna Vasenina <almazisdev@gmail.com>");
+MODULE_AUTHOR("Romanovskiy Mikhail <romanovskymv@gmail.com>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hello world module");
+MODULE_DESCRIPTION("RAM Block device");
